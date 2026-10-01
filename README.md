@@ -14,12 +14,14 @@ If using a place name, the city must be provided with the "-c" flag.
 Downloads:  
 In order to use Troute, you will need to download a GraphML file for the city of your choice.  
 Troute will prompt for this upon the first run, creating the directory structure below.  
+<pre>
 .  
 └── [state]  
     └── [city]  
         ├── constraints.txt (optional, see below)  
         ├── map.graphml  
         └── map.osm (optional, see below)  
+</pre>
   
 Offline Use:  
 For offline use of Troute, you will additionally need an OSM XML file for the same city.  
