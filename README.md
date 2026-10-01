@@ -41,12 +41,12 @@ Users may also use "-p" to print the resulting route map to standard output.
 ## Examples  
 Unconstrained routing with street addresses.  
 `troute -p '709 N Monroe St, Spokane, WA' '125 S Stevens St, Spokane, WA'`  
-![doc](examples/troute.png)
+![doc](examples/1.png)
   
 Routing with constraints set to avoid the Ridler Piano Bar.  
 In this example, names are used instead of addresses.  
 `troute -c 'spokane, wa' -px "indy's barbershop" 'berserk'`  
-![doc](examples/troute2.png)
+![doc](examples/2.png)
   
   
 ## Notes  
