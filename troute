@@ -1,0 +1,518 @@
+#!/bin/bash
+
+read -r -d '' usage << EOF
+  ______                 __     
+ /_  __/________  __  __/ /____   
+  / / / ___/ __ \/ / / / __/ _ \  
+ / / / /  / /_/ / /_/ / /_/  __/  
+/_/ /_/   \____/\__,_/\__/\___/   
+                                
+Terminal Route-Finder
+
+Usage: troute (-c [city, state]) (-p) (-r) (-x) [start] [destination]
+
+Troute finds the shortest path between two street addresses while optionally avoiding certain locations.
+The resulting route is displayed as text, which allows Troute to be used entirely from the terminal.
+
+After the initial downloads for a city of the user's choice, Troute runs fully offline on OSM data.
+The start and destination can usually be provided as coordinates, names, or addresses.
+This depends on the location. Coordinates are the most reliable and always work offline.
+If using a place name, the city must be provided with the "-c" flag.
+
+Downloads:
+In order to use Troute, you will need to download a GraphML file for the city of your choice.
+Troute will prompt for this upon the first run, creating the directory structure below.
+.
+└── [state]
+    └── [city]
+        ├── constraints.txt (optional, see below)
+        ├── map.graphml
+        └── map.osm (optional, see below)
+
+Offline Use:
+For offline use of Troute, you will additionally need an OSM XML file for the same city.
+This will be used to convert addresses and names to coordinates without using a web API.
+It is recommended to use BBBike to obtain this file (https://extract.bbbike.org).
+If you'd instead like to use a web API for conversions, use the "-r" (for "remote") option.
+
+Constraints:
+Constraints may be provided as a file of names, addresses, or coordinate pairs, one per line.
+This file will be ignored by default. Turn on constraint-based routing with "-x".
+
+Output:
+By default, Troute will display the resulting route map until a key is pressed.
+Users may also use "-p" to print the resulting route map to standard output.
+EOF
+
+brng=''
+results=''
+prevdir=''
+direction=''
+length=0
+cols=$(tput cols)
+rows=$(tput lines)
+width=$((cols / 2))
+height=$((rows / 2))
+
+lower() {
+  input=$(</dev/stdin)
+  echo "${input,,}"
+}
+
+before() {
+  line=$(rg -ni "$1" "$2" | cut -d ':' -f 1 | head -n 1)
+  cat "$2" | head -n "$line"
+}
+
+normalize() {
+  # Replace fancy quotes with normal quotes
+  sd '‘' "'" "$1"
+  sd '’' "'" "$1"
+  sd '“' '"' "$1"
+  sd '”' '"' "$1"
+}
+
+coords() {
+  if [[ "$1" == '-r' || ! -f maps/"$state"/"$city"/map.osm ]]; then
+    loc=$(echo "$2" | python3 -c "import sys, urllib.parse; [print(urllib.parse.quote(line.rstrip('\n'), safe='')) for line in sys.stdin]")
+    data=$(curl -s "https://nominatim.openstreetmap.org/search?format=json&q=$loc%20$city%2c%20$state")
+    lat=$(echo "$data" | jq -r .[].lat | head -n 1)
+    lon=$(echo "$data" | jq -r .[].lon | head -n 1)
+    
+    echo "$lat, $lon"
+  else
+    if cat maps/"$state"/"$city"/map.osm | rg -q '‘|’|“|”'; then
+      normalize maps/"$state"/"$city"/map.osm
+    fi
+
+    if [[ "$1" == '-n' ]]; then
+      addr="$2"
+      data=$(before "$addr" maps/"$state"/"$city"/map.osm | rg node | tail -n 1)
+      lat=$(echo "$data" | sd '.* lat="([^"]+)".*' '$1')
+      lon=$(echo "$data" | sd '.* lon="([^"]+)".*' '$1')
+    
+      echo "$lat, $lon"
+    else
+      hnum=$(echo "$1" | cut -d ' ' -f 1)
+      drct=$(echo "$1" | cut -d ' ' -f 2)
+      road=$(echo "$1" | cut -d ' ' -f 3)
+  
+      n=$(cat maps/"$state"/"$city"/map.osm | rg -nA 2 'addr:housenumber' | rg -A 2 "$hnum" | rg -iB 2 "$drct[a-z]+ $road" | head -n 1 | cut -d ':' -f 1)
+      data=$(cat maps/"$state"/"$city"/map.osm | head -n "$n" | rg node | tail -n 1)
+      lat=$(echo "$data" | sd '.* lat="([^"]+)".*' '$1')
+      lon=$(echo "$data" | sd '.* lon="([^"]+)".*' '$1')
+    
+      echo "$lat, $lon"
+    fi
+  fi
+}
+
+lookup() {
+  if [[ "$remote" -eq 1 ]]; then
+    pair=$(coords -r "'$1'" | tr -d ' ')
+  else
+    # Coordinate pairs
+    if [[ "$1" =~ ^[-]?[0-9]+\.[0-9]+,[\ ]?[-]?[0-9]+\.[0-9]+$ ]]; then
+      pair=$(echo "$1" | tr -d ' ')
+    fi 
+  
+    # Street addresses
+    if [[ "$1" =~ ^[0-9]+[\ ]+[a-zA-Z][\ ]+[a-zA-Z]+ ]]; then
+      pair=$(coords "$1" | tr -d ' ')
+    fi 
+  
+    # Establishment names
+    if [[ -z "$pair" ]]; then
+      pair=$(coords -n "$1" | tr -d ' ')
+    fi
+  fi
+
+  echo "$pair"
+  pair=''
+}
+
+setvars() {
+  if [[ -z "$city" ]]; then
+    city=$(echo "$start" | cut -d ',' -f 2 | sd '^[ ]+' '' | lower)
+    state=$(echo "$start" | cut -d ',' -f 3 | sd '^[ ]+' '' | lower)
+  else
+    state=$(echo "$city" | cut -d ',' -f 2 | sd '^[ ]+' '' | lower)
+    city=$(echo "$city" | cut -d ',' -f 1)
+  fi
+  
+  p1=$(lookup "$start")
+  p2=$(lookup "$dest")
+  
+  c1=$(echo "$p1" | cut -d ',' -f 1)
+  c2=$(echo "$p1" | cut -d ',' -f 2)
+  c3=$(echo "$p2" | cut -d ',' -f 1)
+  c4=$(echo "$p2" | cut -d ',' -f 2)
+  
+  brng=$(bearing "$c1" "$c2" "$c3" "$c4")
+
+  # Convert addresses to coordinates
+  if [[ "$constraints" -eq 1 && -f "maps/$state/$city/constraints.txt" ]]; then
+    if cat "maps/$state/$city/constraints.txt" | rg -q '[a-zA-Z]'; then
+      con_coords=''
+      while IFS= read -r x; do
+        y=$(lookup "$x")
+        con_coords+="$y\n"
+      done <<< $(cat "maps/$state/$city/constraints.txt")
+      con_coords=$(echo -e "$con_coords")
+      echo "$con_coords" > "maps/$state/$city/constraints.txt"
+    fi
+  fi
+}
+
+dir_diff() {
+  input=$(</dev/stdin)
+
+  local len
+  local dir
+  
+  local n
+  local e
+  local s
+  local w
+  
+  n=0
+  e=0
+  s=0
+  w=0
+  
+  while IFS= read -r x; do
+    len=$(echo "$x" | cut -d ',' -f 1)
+    dir=$(echo "$x" | cut -d ',' -f 2)
+  
+    if [[ "$dir" == 'n' ]]; then
+      n=$((n + len))
+    elif [[ "$dir" == 'e' ]]; then
+      e=$((e + len))
+    elif [[ "$dir" == 's' ]]; then
+      s=$((s + len))
+    elif [[ "$dir" == 'w' ]]; then
+      w=$((w + len))
+    fi
+  done <<< $(echo "$input")
+
+  total_v=$((s - n))
+  total_h=$((e - w))
+
+  diff_v=$((total_v / 2))
+  diff_h=$((total_h / 2))
+
+  echo "$((height - diff_v)),$((width - diff_h))"
+}
+
+bearing() {
+  local lat1=$1
+  local lon1=$2
+  local lat2=$3
+  local lon2=$4
+
+  local bearing=$(awk -v lat1=$lat1 -v lon1=$lon1 -v lat2=$lat2 -v lon2=$lon2 'BEGIN{
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    angle = atan2(dlon, dlat) * 180 / 3.141592653589793
+    if(angle < 0) angle += 360
+    print angle
+  }')
+
+  local dir=$(awk -v b=$bearing 'BEGIN{
+    if(b >= 45 && b < 135) print "e"
+    else if(b >= 135 && b < 225) print "s"
+    else if(b >= 225 && b < 315) print "w"
+    else print "n"
+  }')
+
+  echo "$dir"
+}
+
+round() {
+  input=$(</dev/stdin)
+  
+  if ! [[ "$input" =~ ^[-]?[0-9]*[.]?[0-9]+$ ]]; then
+    echo 0
+  else
+    python3 -c "import math; x = float($input); print(math.floor(x + 0.5) if x >= 0 else math.ceil(x - 0.5))"
+  fi
+}
+
+change_direction () {
+  if [[ "$1" == 'l' ]]; then
+    if [[ "$direction" == 'n' ]]; then
+       direction='w'
+    elif [[ "$direction" == 'e' ]]; then
+       direction='n'
+    elif [[ "$direction" == 's' ]]; then
+       direction='e'
+    elif [[ "$direction" == 'w' ]]; then
+       direction='s'
+    fi
+  elif [[ "$1" == 'r' ]]; then
+    if [[ "$direction" == 'n' ]]; then
+       direction='e'
+    elif [[ "$direction" == 'e' ]]; then
+       direction='s'
+    elif [[ "$direction" == 's' ]]; then
+       direction='w'
+    elif [[ "$direction" == 'w' ]]; then
+       direction='n'
+    fi
+  fi
+}
+
+get_directions() {
+  direction="$brng"
+  
+  while IFS= read -r x; do
+    if echo "$x" | rg -q 'Left'; then
+      change_direction l
+    elif echo "$x" | rg -q 'Right'; then
+      change_direction r
+    fi
+  
+    stlen=$(echo "$x" | sd '.*: ' '' | rg -o '[0-9.]*')
+    length=$(echo "$stlen * 100" | bc | round)
+
+    st=$(echo "$x" | sd '.* on [^ ]* ' '' | sd ':.*' '')
+
+    if [[ "$direction" == 'n' || "$direction" == 's' ]]; then
+      length=$((length / 2))
+    fi
+  
+    echo "$length,$direction,$st,$stlen"
+  done <<< $(echo "$results")
+}
+
+draw() {
+  if [[ -z "$prevdir" ]]; then
+    tput cup 1 1
+    echo LEGEND:
+    tput cup 2 1
+    echo '⬛ - Start'
+    tput cup 3 1
+    echo '⬤  - Destination'
+    if [[ "$direction" == 'n' ]]; then
+      tput cup "$height" "$width"
+      echo -n '⬛'
+      tput cup $((height + 1)) "$width"
+      echo -n "$st"
+      tput cup $((height + 2)) "$width"
+      echo -n "$stlen"
+    elif [[ "$direction" == 'e' ]]; then
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((--width))
+      done
+      tput cup "$height" $((width - 2))
+      echo -n "$st ⬛"
+      tput cup $((height + 1)) $((width - 2))
+      echo -n "$stlen"
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((++width))
+      done
+    elif [[ "$direction" == 's' ]]; then
+      tput cup "$height" "$width"
+      echo -n '⬛'
+      tput cup $((height + 1)) $((width + 1))
+      echo -n "$st"
+      tput cup $((height + 2)) $((width + 1))
+      echo -n $stlen
+    elif [[ "$direction" == 'w' ]]; then
+      tput cup "$height" "$width"
+      echo -n "⬛$st"
+      tput cup $((height + 1)) $((width + 2))
+      echo -n "$stlen"
+    fi
+  fi
+
+  if [[ "$direction" == 'n' ]]; then
+    if [[ "$prevdir" == 'e' ]]; then
+      ((++width))
+      tput cup "$height" "$width"
+      echo -n "┛$st"
+      tput cup $((height + 1)) $((width + 1))
+      echo -n $stlen
+    elif [[ "$prevdir" == 'w' ]]; then
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((--width))
+      done
+      tput cup "$height" "$width"
+      echo -n "$st┗"
+      tput cup $((height + 1)) "$width"
+      echo -n $stlen
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((++width))
+      done
+    fi
+  elif [[ "$direction" == 'e' ]]; then
+    if [[ "$prevdir" == 'n' ]]; then
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((--width))
+      done
+      tput cup "$height" "$width"
+      echo -n "$st┏"
+      tput cup $((height + 1)) "$width"
+      echo -n $stlen
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((++width))
+      done
+    elif [[ "$prevdir" == 's' ]]; then
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((--width))
+      done
+      tput cup "$height" "$width"
+      echo -n "$st┗"
+      tput cup $((height + 1)) "$width"
+      echo -n $stlen
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((++width))
+      done
+    fi
+  elif [[ "$direction" == 's' ]]; then
+    if [[ "$prevdir" == 'e' ]]; then
+      ((++width))
+      tput cup "$height" "$width"
+      echo -n "┓$st"
+      tput cup $((height + 1)) "$width"
+      echo -n $stlen
+    elif [[ "$prevdir" == 'w' ]]; then
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((--width))
+      done
+      tput cup "$height" "$width"
+      echo -n "$st┏"
+      tput cup $((height + 1)) "$width"
+      echo -n $stlen
+      for x in $(seq 1 $(echo -n "$st" | wc -c)); do
+        ((--width))
+      done
+    fi
+  elif [[ "$direction" == 'w' ]]; then
+    if [[ "$prevdir" == 'n' ]]; then
+      ((--height))
+      tput cup "$height" "$width"
+      echo -n "┓$st"
+      tput cup $((height + 1)) $((width + 1))
+      echo -n $stlen
+    elif [[ "$prevdir" == 's' ]]; then
+      ((++height))
+      tput cup "$height" "$width"
+      echo -n "┛$st"
+      tput cup $((height + 1)) "$width"
+      echo -n $stlen
+    fi
+  fi
+
+  for x in $(seq 1 $((length - 1))); do
+    if [[ "$direction" == 'n' ]]; then
+      ((--height))
+      tput cup "$height" "$width"
+      echo -n '┃'
+    elif [[ "$direction" == 'e' ]]; then
+      ((++width))
+      tput cup "$height" "$width"
+      echo -n '━'
+    elif [[ "$direction" == 's' ]]; then
+      ((++height))
+      tput cup "$height" "$width"
+      echo -n '┃'
+    elif [[ "$direction" == 'w' ]]; then
+      ((--width))
+      tput cup "$height" "$width"
+      echo -n '━'
+    fi
+  done 
+}
+
+mkmap() {
+  height="$1"
+  width="$2"
+  lines="$3"
+
+  tput cup "$height" "$width"
+  
+  while IFS= read -r x; do
+    length=$(echo "$x" | cut -d ',' -f 1)
+    direction=$(echo "$x" | cut -d ',' -f 2)
+    st=$(echo "$x" | cut -d ',' -f 3)
+    stlen="$(echo $x | cut -d ',' -f 4) miles"
+    draw
+    prevdir="$direction"
+  done <<< $(echo "$lines")
+  
+  tput cup "$height" "$width"
+  echo -n '⬤'
+}
+
+city=''
+constraints=0
+remote=0
+print_map=0
+
+OPTIONS=$(getopt -o c:prxh --long help -- "$@" 2>/dev/null)
+
+while getopts 'c:prxh' opt; do
+  case ${opt} in
+    c) city="$OPTARG" ;;
+    p) print_map=1 ;;
+    r) remote=1 ;;
+    x) constraints=1 ;;
+    h) echo "  $usage"; echo; exit 1 ;;
+  esac
+done 2>/dev/null
+
+shift $((OPTIND - 1))
+
+cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")" || exit
+
+if [[ "$#" -eq 0 ]]; then
+  echo "  $usage"; echo; exit 1
+fi
+
+start="$1"
+dest="$2"
+
+setvars 2>/dev/null
+
+if ! [[ -d "maps/$state/$city" ]]; then
+  mkdir -p "maps/$state/$city"
+fi
+
+if [[ "$constraints" -eq 1 ]]; then
+  results=$(./route.py -s "$c1,$c2" -d "$c3,$c4" -m "$state/$city" -x)
+else
+  results=$(./route.py -s "$c1,$c2" -d "$c3,$c4" -m "$state/$city")
+fi
+
+if [[ "$results" == 'Routing failed. Check arguments.' ]]; then
+  echo "$results"
+  exit 1
+fi
+
+lines=$(get_directions)
+offset=$(echo "$lines" | dir_diff)
+height=$(echo "$offset" | cut -d ',' -f 1)
+width=$(echo "$offset" | cut -d ',' -f 2)
+
+if [[ "$print_map" -eq 1 ]]; then
+  tmux new-session -d -s render bash -c "$(declare -f draw; declare -f mkmap); mkmap $height $width \"$lines\"; sleep 1"
+  sleep 1
+  txt=$(tmux capture-pane -t render -p | sed 1d)
+  tmux kill-session -t render
+
+  echo "$txt"
+else
+  tput smcup
+  clear
+  mkmap "$height" "$width" "$lines"
+  tput civis
+  
+  input=''
+  until [[ "$input" == 'q' ]]; do
+    IFS= read -rsn1 input
+  done
+  
+  tput cnorm
+  tput rmcup
+fi
